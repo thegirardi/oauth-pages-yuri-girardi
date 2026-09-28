@@ -126,6 +126,7 @@ export async function onRequestGet(context) {
     });
   }
 
+  // A transação deve ser removida antes da conclusão do fluxo.
   await context.env.DB
     .prepare(
       "DELETE FROM oauth_transactions WHERE id_hash = ?"
@@ -142,6 +143,15 @@ export async function onRequestGet(context) {
     providerName === "google"
       ? context.env.GOOGLE_CLIENT_SECRET
       : context.env.GITHUB_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    return new Response("Server configuration error", {
+      status: 500,
+      headers: {
+        "Cache-Control": "no-store",
+      },
+    });
+  }
 
   const redirectUri =
     `${context.env.PUBLIC_BASE_URL}/oauth/callback/${providerName}`;
@@ -197,8 +207,11 @@ export async function onRequestGet(context) {
       transaction.nonce
     );
   } else {
-    if (!tokenData.access_token) {
-      return new Response("Missing access token", {
+    if (
+      !tokenData.access_token ||
+      String(tokenData.token_type).toLowerCase() !== "bearer"
+    ) {
+      return new Response("Invalid GitHub token", {
         status: 400,
         headers: {
           "Cache-Control": "no-store",
@@ -213,6 +226,7 @@ export async function onRequestGet(context) {
           Authorization:
             `Bearer ${tokenData.access_token}`,
           Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2026-03-10",
           "User-Agent": "oauth-pages-lab",
         },
       }
@@ -229,6 +243,15 @@ export async function onRequestGet(context) {
 
     const profile = await profileResponse.json();
 
+    if (!Number.isInteger(profile.id)) {
+      return new Response("Invalid GitHub identity", {
+        status: 400,
+        headers: {
+          "Cache-Control": "no-store",
+        },
+      });
+    }
+
     identity = {
       issuer: "https://github.com",
       subject: String(profile.id),
@@ -236,7 +259,7 @@ export async function onRequestGet(context) {
       displayName: profile.name ?? profile.login ?? null,
     };
 
-    await fetch(
+    const revokeResponse = await fetch(
       `https://api.github.com/applications/${encodeURIComponent(
         context.env.GITHUB_CLIENT_ID
       )}/grant`,
@@ -250,6 +273,7 @@ export async function onRequestGet(context) {
             ),
           Accept: "application/vnd.github+json",
           "Content-Type": "application/json",
+          "X-GitHub-Api-Version": "2026-03-10",
           "User-Agent": "oauth-pages-lab",
         },
         body: JSON.stringify({
@@ -257,10 +281,23 @@ export async function onRequestGet(context) {
         }),
       }
     );
+
+    if (revokeResponse.status !== 204) {
+      return new Response(
+        "GitHub authorization revocation failed",
+        {
+          status: 400,
+          headers: {
+            "Cache-Control": "no-store",
+          },
+        }
+      );
+    }
   }
 
   const session = randomToken();
-  const sessionHash = await sha256Base64url(session);
+  const sessionHash =
+    await sha256Base64url(session);
 
   const sessionExpiresAt = now + 28800;
 
@@ -289,13 +326,32 @@ export async function onRequestGet(context) {
     )
     .run();
 
+  // IMPORTANTE:
+  // cada cookie precisa ser enviado como um Set-Cookie separado.
+  const headers = new Headers();
+
+  headers.set(
+    "Location",
+    context.env.PUBLIC_BASE_URL
+  );
+
+  headers.append(
+    "Set-Cookie",
+    clearTransactionCookie()
+  );
+
+  headers.append(
+    "Set-Cookie",
+    setSessionCookie(session)
+  );
+
+  headers.set(
+    "Cache-Control",
+    "no-store"
+  );
+
   return new Response(null, {
     status: 302,
-    headers: {
-      Location: context.env.PUBLIC_BASE_URL,
-      "Set-Cookie":
-        `${clearTransactionCookie()}, ${setSessionCookie(session)}`,
-      "Cache-Control": "no-store",
-    },
+    headers,
   });
 }
